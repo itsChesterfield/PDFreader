@@ -523,7 +523,7 @@ class MainWindow(QMainWindow):
         self._viewer.show_search_results(results)
         total = sum(len(v) for v in results.values())
         self.statusBar().showMessage(
-            f"Suche: {total} Treffer für „{query}"" if total else f"Kein Ergebnis für „{query}"",
+            f'Suche: {total} Treffer fuer "{query}"' if total else f'Kein Ergebnis fuer "{query}"',
             4000,
         )
         if results:
