@@ -1,6 +1,5 @@
 import sys
 
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 from src.main_window import MainWindow
@@ -10,8 +9,6 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("PDFreader")
     app.setOrganizationName("PDFreader")
-    app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
-
     window = MainWindow()
     window.resize(1200, 800)
     window.show()
