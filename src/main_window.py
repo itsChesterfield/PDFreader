@@ -1,396 +1,309 @@
+"""Verdant PDF Reader — main application window."""
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QSize, Qt, QTimer
-from PyQt6.QtGui import QAction, QColor, QIcon, QKeySequence, QPalette
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
+from PyQt6.QtGui import QAction, QColor, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
-    QComboBox,
     QFileDialog,
-    QLabel,
+    QHBoxLayout,
+    QInputDialog,
     QMainWindow,
     QMessageBox,
-    QSplitter,
-    QStatusBar,
-    QToolBar,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from .constants import (
-    DEFAULT_ZOOM,
-    HIGHLIGHT_COLORS,
-    MAX_ZOOM,
-    MIN_ZOOM,
-    ZOOM_STEP,
-    Tool,
-)
+from .constants import Tool
+from .dialogs import ExportDialog
+from .left_panel import LeftPanel
+from .minimap import MiniMap
+from .models import Bookmark, DocumentLibrary, VAnnotation
 from .pdf_document import PDFDocument
 from .pdf_viewer import PDFViewer
-from .thumbnail_panel import ThumbnailPanel
+from .right_panel import AnnotationsPanel
+from .sidenav import SideNav
+from .theme import (
+    ACCENT, BG, BORDER, MUTED, RIGHT_W, STATUSBAR_H, SURFACE, SURFACE2,
+    TEXT, WARN,
+)
+from .toolbar_widget import ToolBar
 
 
-_MAIN_STYLE = """
-QMainWindow { background: #2b2b2b; }
-QMenuBar {
-    background: #3c3f41;
-    color: #cccccc;
-    border-bottom: 1px solid #555555;
-}
-QMenuBar::item:selected { background: #4b6eaf; }
-QMenu {
-    background: #3c3f41;
-    color: #cccccc;
-    border: 1px solid #555555;
-}
-QMenu::item:selected { background: #4b6eaf; }
-QToolBar {
-    background: #3c3f41;
-    border-bottom: 1px solid #555555;
-    spacing: 4px;
-    padding: 2px 6px;
-}
-QToolButton {
-    background: transparent;
-    color: #cccccc;
-    border: none;
-    border-radius: 4px;
-    padding: 4px 8px;
-    font-size: 13px;
-}
-QToolButton:hover { background: #4b6eaf; color: white; }
-QToolButton:checked { background: #4b6eaf; color: white; }
-QComboBox {
-    background: #3c3f41;
-    color: #cccccc;
-    border: 1px solid #555555;
-    border-radius: 4px;
-    padding: 2px 6px;
-    min-width: 70px;
-}
-QComboBox QAbstractItemView {
-    background: #3c3f41;
-    color: #cccccc;
-    selection-background-color: #4b6eaf;
-}
-QStatusBar {
-    background: #3c3f41;
-    color: #aaaaaa;
-    border-top: 1px solid #555555;
-    font-size: 12px;
-}
-QSplitter::handle { background: #555555; width: 1px; }
+_STATUS_STYLE = f"""
+QWidget {{ background: {SURFACE}; border-top: 1px solid {BORDER}; }}
+QLabel  {{ color: {MUTED}; font-size: 10px; font-family: 'DM Mono','Consolas';
+           background: transparent; border: none; padding: 0 8px; }}
 """
+
+
+class _StatusBar(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(STATUSBAR_H)
+        self.setStyleSheet(_STATUS_STYLE)
+
+        from PyQt6.QtWidgets import QProgressBar
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Reading progress bar (full width, 2 px)
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 1000)
+        self._bar.setValue(0)
+        self._bar.setTextVisible(False)
+        self._bar.setFixedHeight(2)
+        self._bar.setStyleSheet(
+            f"QProgressBar{{background:{BORDER};border:none;border-radius:0;}}"
+            f"QProgressBar::chunk{{background:{ACCENT};border-radius:0;}}"
+        )
+
+        from PyQt6.QtWidgets import QVBoxLayout as _VBox
+        outer = _VBox()
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self._bar)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+
+        # Pulse dot + label
+        from PyQt6.QtWidgets import QLabel
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color:{ACCENT};font-size:8px;padding:0 4px 0 8px;")
+        row.addWidget(dot)
+
+        self._app_label = QLabel("Verdant Reader")
+        self._app_label.setStyleSheet(f"color:{ACCENT};font-weight:600;")
+        row.addWidget(self._app_label)
+        row.addStretch(1)
+
+        self._read_label = QLabel("0 % gelesen")
+        row.addWidget(self._read_label)
+
+        self._zoom_label = QLabel("Zoom 100 %")
+        row.addWidget(self._zoom_label)
+
+        outer.addLayout(row)
+        layout.addLayout(outer)
+
+    def set_progress(self, progress: float, zoom: float) -> None:
+        self._bar.setValue(int(progress * 1000))
+        self._read_label.setText(f"{int(progress * 100)} % gelesen")
+        self._zoom_label.setText(f"Zoom {int(zoom * 100)} %")
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self._doc = PDFDocument()
-        self._current_tool = Tool.SELECT
-        self._highlight_color = "Gelb"
+        self._doc      = PDFDocument()
+        self._library  = DocumentLibrary()
+        self._show_annotations = False
+        self._anim_right: Optional[QPropertyAnimation] = None
 
-        self.setWindowTitle("PDFreader")
-        self.setMinimumSize(900, 640)
-        self.setStyleSheet(_MAIN_STYLE)
+        self.setWindowTitle("Verdant Reader")
+        self.setMinimumSize(960, 640)
 
-        self._build_ui()
+        self._build_central()
         self._build_menu()
-        self._build_toolbar()
-        self._build_statusbar()
-        self._set_actions_enabled(False)
+        self._connect_signals()
+        self._set_doc_actions_enabled(False)
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
+    # Layout construction
+    # ──────────────────────────────────────────────────────────────────────
 
-    def _build_ui(self) -> None:
+    def _build_central(self) -> None:
+        root = QWidget()
+        self.setCentralWidget(root)
+
+        # Outer vertical: [main row] + [status bar]
+        outer_v = QVBoxLayout(root)
+        outer_v.setContentsMargins(0, 0, 0, 0)
+        outer_v.setSpacing(0)
+
+        # Main horizontal row
+        main_row = QHBoxLayout()
+        main_row.setContentsMargins(0, 0, 0, 0)
+        main_row.setSpacing(0)
+
+        # 1 · Sidenav
+        self._sidenav = SideNav()
+        main_row.addWidget(self._sidenav)
+
+        # 2 · Left panel (collapsible)
+        self._left = LeftPanel(self._library)
+        main_row.addWidget(self._left)
+
+        # 3 · Centre: toolbar + viewer (with minimap overlay)
+        centre = QWidget()
+        centre.setStyleSheet(f"background:{BG};")
+        cv = QVBoxLayout(centre)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(0)
+
+        self._toolbar = ToolBar()
+        cv.addWidget(self._toolbar)
+
+        # Viewer wrapper (to position minimap absolutely)
+        viewer_wrap = QWidget()
+        viewer_wrap.setStyleSheet(f"background:{BG};")
+        vw_layout = QVBoxLayout(viewer_wrap)
+        vw_layout.setContentsMargins(0, 0, 0, 0)
+        vw_layout.setSpacing(0)
+
         self._viewer = PDFViewer(self._doc)
-        self._viewer.page_changed.connect(self._on_page_changed)
-        self._viewer.annotation_added.connect(self._on_annotation_added)
+        vw_layout.addWidget(self._viewer)
 
-        self._thumbs = ThumbnailPanel(self._doc)
-        self._thumbs.page_selected.connect(self._viewer.go_to_page)
-        self._thumbs.page_selected.connect(self._on_page_changed)
+        self._minimap = MiniMap(self._doc, viewer_wrap)
+        self._minimap.hide()
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self._thumbs)
-        splitter.addWidget(self._viewer)
-        splitter.setSizes([150, 750])
-        splitter.setCollapsible(0, True)
-        splitter.setCollapsible(1, False)
-        self._splitter = splitter
+        cv.addWidget(viewer_wrap)
+        main_row.addWidget(centre, stretch=1)
 
-        self.setCentralWidget(splitter)
+        # 4 · Right panel (annotations, collapsible)
+        self._right = AnnotationsPanel()
+        self._right.setMaximumWidth(0)
+        main_row.addWidget(self._right)
+
+        outer_v.addLayout(main_row)
+
+        # Status bar
+        self._status = _StatusBar()
+        outer_v.addWidget(self._status)
+
+        # Position minimap after layout is ready
+        QTimer.singleShot(0, self._position_minimap)
 
     def _build_menu(self) -> None:
         mb = self.menuBar()
 
-        # --- File ---
         file_menu = mb.addMenu("Datei")
+        self._act_open    = QAction("Oeffnen ...",           self, shortcut="Ctrl+O", triggered=self._open_file)
+        self._act_save    = QAction("Speichern",             self, shortcut="Ctrl+S", triggered=self._save_file)
+        self._act_save_as = QAction("Speichern unter ...",   self, shortcut="Ctrl+Shift+S", triggered=self._save_as)
+        self._act_export  = QAction("Exportieren ...",       self, shortcut="Ctrl+E", triggered=self._export)
+        self._act_close   = QAction("Schliessen",            self, triggered=self._close_file)
+        act_quit          = QAction("Beenden",               self, shortcut="Ctrl+Q",
+                                    triggered=QApplication.instance().quit)
+        for act in (self._act_open, self._act_save, self._act_save_as,
+                    self._act_export, self._act_close, act_quit):
+            file_menu.addAction(act)
 
-        act_open = QAction("Öffnen …", self)
-        act_open.setShortcut(QKeySequence.StandardKey.Open)
-        act_open.triggered.connect(self.open_file)
-        file_menu.addAction(act_open)
-
-        self._act_save = QAction("Speichern", self)
-        self._act_save.setShortcut(QKeySequence.StandardKey.Save)
-        self._act_save.triggered.connect(self.save_file)
-        file_menu.addAction(self._act_save)
-
-        self._act_save_as = QAction("Speichern unter …", self)
-        self._act_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
-        self._act_save_as.triggered.connect(self.save_file_as)
-        file_menu.addAction(self._act_save_as)
-
-        file_menu.addSeparator()
-
-        self._act_export = QAction("Exportieren / Format ändern …", self)
-        self._act_export.setShortcut(QKeySequence("Ctrl+E"))
-        self._act_export.triggered.connect(self.export_file)
-        file_menu.addAction(self._act_export)
-
-        file_menu.addSeparator()
-
-        act_close = QAction("Schließen", self)
-        act_close.triggered.connect(self.close_file)
-        file_menu.addAction(act_close)
-
-        act_quit = QAction("Beenden", self)
-        act_quit.setShortcut(QKeySequence.StandardKey.Quit)
-        act_quit.triggered.connect(QApplication.instance().quit)
-        file_menu.addAction(act_quit)
-
-        # --- View ---
         view_menu = mb.addMenu("Ansicht")
+        QAction("Vergrossern",     self, shortcut="Ctrl++", triggered=self._viewer.zoom_in,  parent=self)
+        QAction("Verkleinern",     self, shortcut="Ctrl+-", triggered=self._viewer.zoom_out, parent=self)
+        for act in (
+            QAction("Vergrossern",   self, shortcut="Ctrl++", triggered=self._viewer.zoom_in),
+            QAction("Verkleinern",   self, shortcut="Ctrl+-", triggered=self._viewer.zoom_out),
+            QAction("Zoom Reset",    self, shortcut="Ctrl+0", triggered=self._zoom_reset),
+            QAction("Breite",        self, shortcut="Ctrl+W", triggered=self._viewer.fit_width),
+            QAction("Suche",         self, shortcut="Ctrl+F", triggered=self._open_search),
+            QAction("Lesezeichen",   self, shortcut="Ctrl+B", triggered=self._toggle_bookmarks),
+        ):
+            view_menu.addAction(act)
+            self.addAction(act)
 
-        self._act_zoom_in = QAction("Vergrößern", self)
-        self._act_zoom_in.setShortcut(QKeySequence.StandardKey.ZoomIn)
-        self._act_zoom_in.triggered.connect(self._viewer.zoom_in)
-        view_menu.addAction(self._act_zoom_in)
+        # Keyboard navigation
+        for key, fn in [
+            ("Left",  self._prev_page), ("Right", self._next_page),
+            ("H",     self._prev_page), ("L",     self._next_page),
+            ("+",     self._viewer.zoom_in), ("-", self._viewer.zoom_out),
+            ("Escape", self._toolbar.deselect_tool),
+        ]:
+            act = QAction(self)
+            act.setShortcut(QKeySequence(key))
+            act.triggered.connect(fn)
+            self.addAction(act)
 
-        self._act_zoom_out = QAction("Verkleinern", self)
-        self._act_zoom_out.setShortcut(QKeySequence.StandardKey.ZoomOut)
-        self._act_zoom_out.triggered.connect(self._viewer.zoom_out)
-        view_menu.addAction(self._act_zoom_out)
+    def _connect_signals(self) -> None:
+        # Sidenav
+        self._sidenav.tab_changed.connect(self._on_tab_changed)
 
-        self._act_zoom_reset = QAction("Originalgröße", self)
-        self._act_zoom_reset.setShortcut(QKeySequence("Ctrl+0"))
-        self._act_zoom_reset.triggered.connect(lambda: self._viewer.set_zoom(DEFAULT_ZOOM))
-        view_menu.addAction(self._act_zoom_reset)
+        # Left panel
+        self._left.document_selected.connect(self._switch_document)
+        self._left.open_requested.connect(self._open_file)
+        self._left.page_selected.connect(self._viewer.go_to_page)
+        self._left.search_requested.connect(self._do_search)
+        self._left.add_bookmark.connect(self._add_bookmark)
+        self._left.zoom_reset.connect(self._zoom_reset)
+        self._left.fit_width.connect(self._viewer.fit_width)
+        self._left.bg_changed.connect(self._on_bg_changed)
 
-        view_menu.addSeparator()
+        # Toolbar
+        self._toolbar.prev_page.connect(self._prev_page)
+        self._toolbar.next_page.connect(self._next_page)
+        self._toolbar.page_jumped.connect(self._viewer.go_to_page)
+        self._toolbar.zoom_in.connect(self._viewer.zoom_in)
+        self._toolbar.zoom_out.connect(self._viewer.zoom_out)
+        self._toolbar.zoom_reset.connect(self._zoom_reset)
+        self._toolbar.fit_width_requested.connect(self._viewer.fit_width)
+        self._toolbar.tool_changed.connect(self._on_tool_changed)
+        self._toolbar.annotations_toggled.connect(self._toggle_annotations)
+        self._toolbar.open_file.connect(self._open_file)
+        self._toolbar.save_file.connect(self._save_file)
 
-        self._act_toggle_thumbs = QAction("Seitenleiste anzeigen", self)
-        self._act_toggle_thumbs.setCheckable(True)
-        self._act_toggle_thumbs.setChecked(True)
-        self._act_toggle_thumbs.triggered.connect(self._toggle_sidebar)
-        view_menu.addAction(self._act_toggle_thumbs)
+        # Viewer
+        self._viewer.page_changed.connect(self._on_page_changed)
+        self._viewer.annotation_added.connect(self._on_pdf_annotation_added)
+        self._viewer.zoom_changed.connect(self._on_zoom_changed)
 
-        view_menu.addSeparator()
+        # Right panel
+        self._right.annotation_navigate.connect(self._viewer.go_to_page)
+        self._right.add_annotation.connect(self._add_v_annotation)
 
-        self._act_goto = QAction("Zur Seite …", self)
-        self._act_goto.setShortcut(QKeySequence("Ctrl+G"))
-        self._act_goto.triggered.connect(self._goto_page)
-        view_menu.addAction(self._act_goto)
+        # Minimap
+        self._minimap.page_selected.connect(self._viewer.go_to_page)
 
-        # --- Tools ---
-        tools_menu = mb.addMenu("Werkzeuge")
-
-        self._act_tool_select = QAction("Auswahl / Blättern", self)
-        self._act_tool_select.setCheckable(True)
-        self._act_tool_select.setChecked(True)
-        self._act_tool_select.triggered.connect(lambda: self._set_tool(Tool.SELECT))
-        tools_menu.addAction(self._act_tool_select)
-
-        self._act_tool_highlight = QAction("Markieren", self)
-        self._act_tool_highlight.setCheckable(True)
-        self._act_tool_highlight.triggered.connect(lambda: self._set_tool(Tool.HIGHLIGHT))
-        tools_menu.addAction(self._act_tool_highlight)
-
-        self._act_tool_text = QAction("Text einfügen", self)
-        self._act_tool_text.setCheckable(True)
-        self._act_tool_text.triggered.connect(lambda: self._set_tool(Tool.TEXT))
-        tools_menu.addAction(self._act_tool_text)
-
-        self._act_tool_note = QAction("Notiz hinzufügen", self)
-        self._act_tool_note.setCheckable(True)
-        self._act_tool_note.triggered.connect(lambda: self._set_tool(Tool.NOTE))
-        tools_menu.addAction(self._act_tool_note)
-
-        tools_menu.addSeparator()
-
-        self._act_search = QAction("Suchen …", self)
-        self._act_search.setShortcut(QKeySequence.StandardKey.Find)
-        self._act_search.triggered.connect(self._toggle_search)
-        tools_menu.addAction(self._act_search)
-
-        self._tool_actions = [
-            self._act_tool_select,
-            self._act_tool_highlight,
-            self._act_tool_text,
-            self._act_tool_note,
-        ]
-
-    def _build_toolbar(self) -> None:
-        tb = QToolBar("Hauptleiste", self)
-        tb.setMovable(False)
-        tb.setIconSize(QSize(18, 18))
-        self.addToolBar(tb)
-
-        # Open / Save
-        btn_open = QToolButton()
-        btn_open.setText("📂 Öffnen")
-        btn_open.clicked.connect(self.open_file)
-        tb.addWidget(btn_open)
-
-        self._btn_save = QToolButton()
-        self._btn_save.setText("💾 Speichern")
-        self._btn_save.clicked.connect(self.save_file)
-        tb.addWidget(self._btn_save)
-
-        tb.addSeparator()
-
-        # Tools
-        self._btn_select = QToolButton()
-        self._btn_select.setText("↖ Auswahl")
-        self._btn_select.setCheckable(True)
-        self._btn_select.setChecked(True)
-        self._btn_select.clicked.connect(lambda: self._set_tool(Tool.SELECT))
-        tb.addWidget(self._btn_select)
-
-        self._btn_highlight = QToolButton()
-        self._btn_highlight.setText("🖊 Markieren")
-        self._btn_highlight.setCheckable(True)
-        self._btn_highlight.clicked.connect(lambda: self._set_tool(Tool.HIGHLIGHT))
-        tb.addWidget(self._btn_highlight)
-
-        # Highlight color picker
-        self._color_combo = QComboBox()
-        for name in HIGHLIGHT_COLORS:
-            self._color_combo.addItem(name)
-        self._color_combo.setFixedWidth(80)
-        self._color_combo.currentTextChanged.connect(self._on_color_changed)
-        tb.addWidget(self._color_combo)
-
-        self._btn_text = QToolButton()
-        self._btn_text.setText("T Text")
-        self._btn_text.setCheckable(True)
-        self._btn_text.clicked.connect(lambda: self._set_tool(Tool.TEXT))
-        tb.addWidget(self._btn_text)
-
-        self._btn_note = QToolButton()
-        self._btn_note.setText("📌 Notiz")
-        self._btn_note.setCheckable(True)
-        self._btn_note.clicked.connect(lambda: self._set_tool(Tool.NOTE))
-        tb.addWidget(self._btn_note)
-
-        tb.addSeparator()
-
-        # Zoom
-        btn_zoom_out = QToolButton()
-        btn_zoom_out.setText("−")
-        btn_zoom_out.clicked.connect(self._viewer.zoom_out)
-        tb.addWidget(btn_zoom_out)
-
-        self._zoom_label = QLabel("100%")
-        self._zoom_label.setFixedWidth(46)
-        self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._zoom_label.setStyleSheet("color: #cccccc; font-size: 13px;")
-        tb.addWidget(self._zoom_label)
-
-        btn_zoom_in = QToolButton()
-        btn_zoom_in.setText("+")
-        btn_zoom_in.clicked.connect(self._viewer.zoom_in)
-        tb.addWidget(btn_zoom_in)
-
-        tb.addSeparator()
-
-        # Search
-        self._btn_search = QToolButton()
-        self._btn_search.setText("🔍 Suchen")
-        self._btn_search.setCheckable(True)
-        self._btn_search.clicked.connect(self._toggle_search)
-        tb.addWidget(self._btn_search)
-
-        tb.addSeparator()
-
-        # Export
-        btn_export = QToolButton()
-        btn_export.setText("⬆ Exportieren")
-        btn_export.clicked.connect(self.export_file)
-        tb.addWidget(btn_export)
-
-        self._tool_buttons = {
-            Tool.SELECT:    self._btn_select,
-            Tool.HIGHLIGHT: self._btn_highlight,
-            Tool.TEXT:      self._btn_text,
-            Tool.NOTE:      self._btn_note,
-        }
-
-        # Search bar (hidden by default)
-        from .dialogs import SearchBar
-        self._search_bar = SearchBar()
-        self._search_bar.setVisible(False)
-        self._search_bar.search_requested.connect(self._do_search)
-        self._search_bar.closed.connect(self._close_search)
-
-        # Add search bar as a second toolbar row
-        tb2 = QToolBar("Suche", self)
-        tb2.setMovable(False)
-        tb2.addWidget(self._search_bar)
-        tb2.setVisible(False)
-        self._search_toolbar = tb2
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb2)
-
-    def _build_statusbar(self) -> None:
-        sb = self.statusBar()
-        self._lbl_page = QLabel("Keine Datei geöffnet")
-        self._lbl_page.setStyleSheet("padding: 0 8px;")
-        sb.addWidget(self._lbl_page)
-
-        self._lbl_file = QLabel("")
-        self._lbl_file.setStyleSheet("padding: 0 8px; color: #888888;")
-        sb.addPermanentWidget(self._lbl_file)
-
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
     # File operations
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
 
-    def open_file(self) -> None:
-        if self._doc.modified:
-            if not self._confirm_discard():
-                return
+    def _open_file(self) -> None:
+        if self._doc.modified and not self._confirm_discard():
+            return
         path, _ = QFileDialog.getOpenFileName(
-            self, "PDF öffnen", "", "PDF-Dateien (*.pdf)"
+            self, "PDF oeffnen", "", "PDF-Dateien (*.pdf)"
         )
         if not path:
             return
+        self._load_path(path)
+
+    def _load_path(self, path: str) -> None:
         if self._doc.is_open:
             self._doc.close()
-        if self._doc.open(path):
-            self._viewer.load_document()
-            self._thumbs.load_document()
-            self._set_actions_enabled(True)
-            self._update_status(0)
-            self._viewer.go_to_page(0)
-        else:
-            QMessageBox.critical(self, "Fehler", f"PDF konnte nicht geöffnet werden:\n{path}")
+        if not self._doc.open(path):
+            QMessageBox.critical(self, "Fehler", f"Konnte nicht geoeffnet werden:\n{path}")
+            return
 
-    def save_file(self) -> None:
+        title = Path(path).stem
+        lib_doc = self._library.open(path, title, self._doc.page_count)
+
+        self._viewer.load_document()
+        self._minimap.load_document()
+        self._minimap.show()
+        self._position_minimap()
+
+        self._toolbar.set_document(title, self._doc.page_count)
+        self._left.refresh_files()
+        self._left.load_bookmarks(lib_doc.bookmarks)
+        self._right.load(lib_doc.v_annotations)
+        self._set_doc_actions_enabled(True)
+        self._update_status(0, self._viewer.current_zoom())
+        self.setWindowTitle(f"Verdant Reader  —  {title}")
+
+    def _save_file(self) -> None:
         if not self._doc.is_open:
             return
-        if self._doc.save():
-            self.statusBar().showMessage("Gespeichert.", 3000)
-        else:
+        if not self._doc.save():
             QMessageBox.warning(self, "Fehler", "Speichern fehlgeschlagen.")
 
-    def save_file_as(self) -> None:
+    def _save_as(self) -> None:
         if not self._doc.is_open:
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -399,217 +312,244 @@ class MainWindow(QMainWindow):
         if path:
             if not path.endswith(".pdf"):
                 path += ".pdf"
-            if self._doc.save(path):
-                self.statusBar().showMessage(f"Gespeichert: {path}", 3000)
-            else:
-                QMessageBox.warning(self, "Fehler", "Speichern fehlgeschlagen.")
+            self._doc.save(path)
 
-    def close_file(self) -> None:
+    def _export(self) -> None:
+        if not self._doc.is_open:
+            return
+        dlg = ExportDialog(self)
+        if not dlg.exec():
+            return
+        fmt = dlg.selected_format
+        stem = self._doc.path.stem if self._doc.path else "export"
+        parent_dir = str(self._doc.path.parent) if self._doc.path else ""
+        if fmt == "txt":
+            p, _ = QFileDialog.getSaveFileName(self, "Als Text", f"{parent_dir}/{stem}.txt", "*.txt")
+            if p:
+                self._doc.export_text(p)
+        elif fmt == "docx":
+            p, _ = QFileDialog.getSaveFileName(self, "Als Word", f"{parent_dir}/{stem}.docx", "*.docx")
+            if p:
+                self._doc.export_docx(p)
+        elif fmt in ("png", "jpg"):
+            d = QFileDialog.getExistingDirectory(self, "Ordner fuer Bilder", parent_dir)
+            if d:
+                self._doc.export_images(d, fmt=fmt)
+        elif fmt == "pdf":
+            p, _ = QFileDialog.getSaveFileName(self, "PDF speichern unter", f"{parent_dir}/{stem}_kopie.pdf", "*.pdf")
+            if p:
+                self._doc.save(p)
+
+    def _close_file(self) -> None:
         if not self._doc.is_open:
             return
         if self._doc.modified and not self._confirm_discard():
             return
         self._doc.close()
         self._viewer._clear()
-        self._thumbs._list.clear()
-        self._set_actions_enabled(False)
-        self._lbl_page.setText("Keine Datei geöffnet")
-        self._lbl_file.setText("")
-        self.setWindowTitle("PDFreader")
+        self._minimap.hide()
+        self._set_doc_actions_enabled(False)
+        self.setWindowTitle("Verdant Reader")
 
-    def export_file(self) -> None:
-        if not self._doc.is_open:
-            return
-        from .dialogs import ExportDialog
-        dlg = ExportDialog(self)
-        if not dlg.exec():
-            return
+    def _switch_document(self, doc_id: int) -> None:
+        lib_doc = self._library.activate(doc_id)
+        if lib_doc and lib_doc.path != (str(self._doc.path) if self._doc.path else ""):
+            self._load_path(lib_doc.path)
 
-        fmt = dlg.selected_format
-        stem = self._doc.path.stem if self._doc.path else "export"
-        parent_dir = str(self._doc.path.parent) if self._doc.path else ""
+    # ──────────────────────────────────────────────────────────────────────
+    # Navigation
+    # ──────────────────────────────────────────────────────────────────────
 
-        if fmt == "pdf":
-            path, _ = QFileDialog.getSaveFileName(
-                self, "PDF speichern unter", f"{parent_dir}/{stem}_kopie.pdf",
-                "PDF-Dateien (*.pdf)"
-            )
-            if path:
-                self._doc.save(path)
+    def _prev_page(self) -> None:
+        p = self._viewer.current_page()
+        if p > 0:
+            self._viewer.go_to_page(p - 1)
 
-        elif fmt == "txt":
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Als Text speichern", f"{parent_dir}/{stem}.txt",
-                "Textdateien (*.txt)"
-            )
-            if path:
-                ok = self._doc.export_text(path)
-                self._show_export_result(ok, path)
+    def _next_page(self) -> None:
+        p = self._viewer.current_page()
+        if p < self._doc.page_count - 1:
+            self._viewer.go_to_page(p + 1)
 
-        elif fmt == "docx":
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Als Word speichern", f"{parent_dir}/{stem}.docx",
-                "Word-Dokumente (*.docx)"
-            )
-            if path:
-                ok = self._doc.export_docx(path)
-                self._show_export_result(ok, path)
+    # ──────────────────────────────────────────────────────────────────────
+    # Panel management
+    # ──────────────────────────────────────────────────────────────────────
 
-        elif fmt in ("png", "jpg"):
-            directory = QFileDialog.getExistingDirectory(
-                self, "Ordner für Bildexport wählen", parent_dir
-            )
-            if directory:
-                ok = self._doc.export_images(directory, fmt=fmt)
-                self._show_export_result(ok, directory)
+    def _on_tab_changed(self, tab_id: str) -> None:
+        self._left.show_tab(tab_id)
+        if tab_id == "search":
+            self._left.focus_search()
 
-    def _show_export_result(self, ok: bool, path: str) -> None:
-        if ok:
-            self.statusBar().showMessage(f"Exportiert nach: {path}", 4000)
-        else:
-            QMessageBox.warning(self, "Export fehlgeschlagen",
-                                "Der Export konnte nicht abgeschlossen werden.\n"
-                                "Prüfe, ob alle benötigten Pakete installiert sind.")
+    def _toggle_annotations(self, show: bool) -> None:
+        self._show_annotations = show
+        target = RIGHT_W if show else 0
+        if self._anim_right:
+            self._anim_right.stop()
+        self._anim_right = QPropertyAnimation(self._right, b"maximumWidth", self)
+        self._anim_right.setStartValue(self._right.maximumWidth())
+        self._anim_right.setEndValue(target)
+        self._anim_right.setDuration(200)
+        self._anim_right.setEasingCurve(
+            QEasingCurve.Type.OutCubic if show else QEasingCurve.Type.InCubic
+        )
+        self._anim_right.start()
 
-    # ------------------------------------------------------------------
-    # Tool management
-    # ------------------------------------------------------------------
+    def _open_search(self) -> None:
+        self._sidenav.set_active("search")
+        self._left.show_tab("search")
+        self._left.focus_search()
 
-    def _set_tool(self, tool: Tool) -> None:
-        self._current_tool = tool
-        self._viewer.set_tool(tool)
-        for t, btn in self._tool_buttons.items():
-            btn.setChecked(t == tool)
-        for act in self._tool_actions:
-            act.setChecked(False)
-        tool_to_act = {
-            Tool.SELECT:    self._act_tool_select,
-            Tool.HIGHLIGHT: self._act_tool_highlight,
-            Tool.TEXT:      self._act_tool_text,
-            Tool.NOTE:      self._act_tool_note,
+    def _toggle_bookmarks(self) -> None:
+        self._sidenav.set_active("bookmarks")
+        self._left.show_tab("bookmarks")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Tools & zoom
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _on_tool_changed(self, tid: str) -> None:
+        tool_map = {
+            "highlight": Tool.HIGHLIGHT,
+            "comment":   Tool.NOTE,
+            "pen":       Tool.TEXT,
+            "":          Tool.SELECT,
         }
-        if tool in tool_to_act:
-            tool_to_act[tool].setChecked(True)
+        self._viewer.set_tool(tool_map.get(tid, Tool.SELECT))
 
-    def _on_color_changed(self, name: str) -> None:
-        self._highlight_color = name
-        self._viewer.set_highlight_color(name)
+    def _zoom_reset(self) -> None:
+        self._viewer.set_zoom(1.0)
 
-    # ------------------------------------------------------------------
+    def _on_bg_changed(self, mode: str) -> None:
+        colors = {
+            "dark":  "#0d1a13",
+            "sepia": "#1a1508",
+            "light": "#2a2a2a",
+        }
+        bg = colors.get(mode, "#0d1a13")
+        self._viewer._container.setStyleSheet(f"background:{bg};")
+
+    # ──────────────────────────────────────────────────────────────────────
     # Search
-    # ------------------------------------------------------------------
-
-    def _toggle_search(self) -> None:
-        visible = not self._search_bar.isVisible()
-        self._search_bar.setVisible(visible)
-        self._search_toolbar.setVisible(visible)
-        self._btn_search.setChecked(visible)
-        if visible:
-            self._search_bar.focus_input()
-        else:
-            self._viewer.clear_search()
-
-    def _close_search(self) -> None:
-        self._search_bar.setVisible(False)
-        self._search_toolbar.setVisible(False)
-        self._btn_search.setChecked(False)
-        self._viewer.clear_search()
+    # ──────────────────────────────────────────────────────────────────────
 
     def _do_search(self, query: str) -> None:
-        if not query or not self._doc.is_open:
+        if not self._doc.is_open or not query:
             self._viewer.clear_search()
+            self._left.clear_search()
             return
         results = self._doc.search(query)
         self._viewer.show_search_results(results)
-        total = sum(len(v) for v in results.values())
-        self.statusBar().showMessage(
-            f'Suche: {total} Treffer fuer "{query}"' if total else f'Kein Ergebnis fuer "{query}"',
-            4000,
-        )
+        self._left.show_search_results(results)
         if results:
-            first_page = next(iter(results))
-            self._viewer.go_to_page(first_page)
+            self._viewer.go_to_page(next(iter(results)))
 
-    # ------------------------------------------------------------------
-    # Navigation helpers
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
+    # Bookmarks & annotations
+    # ──────────────────────────────────────────────────────────────────────
 
-    def _goto_page(self) -> None:
+    def _add_bookmark(self) -> None:
         if not self._doc.is_open:
             return
-        from .dialogs import GoToPageDialog
-        current = getattr(self._viewer, "_current_page", 0)
-        dlg = GoToPageDialog(current, self._doc.page_count, self)
-        if dlg.exec():
-            self._viewer.go_to_page(dlg.result_page)
+        lib_doc = self._library.active()
+        if not lib_doc:
+            return
+        page = self._viewer.current_page()
+        title, ok = QInputDialog.getText(
+            self, "Lesezeichen hinzufuegen",
+            f"Titel (Seite {page + 1}):",
+            text=f"Seite {page + 1}",
+        )
+        if ok and title.strip():
+            bm = Bookmark(title.strip(), page)
+            lib_doc.bookmarks.append(bm)
+            self._left.load_bookmarks(lib_doc.bookmarks, page)
 
-    def _toggle_sidebar(self, checked: bool) -> None:
-        self._thumbs.setVisible(checked)
+    def _add_v_annotation(self, color: str) -> None:
+        if not self._doc.is_open:
+            return
+        lib_doc = self._library.active()
+        if not lib_doc:
+            return
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Anmerkung hinzufuegen",
+            f"Text (Seite {self._viewer.current_page() + 1}):",
+        )
+        if ok and text.strip():
+            ann = VAnnotation(self._viewer.current_page(), text.strip(), color=color)
+            lib_doc.v_annotations.append(ann)
+            self._right.load(lib_doc.v_annotations, self._viewer.current_page())
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
     # Slots
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────
 
-    def _on_page_changed(self, page_num: int) -> None:
-        self._update_status(page_num)
-        self._thumbs.set_current_page(page_num)
+    def _on_page_changed(self, page: int) -> None:
+        self._toolbar.set_page(page)
+        self._minimap.set_current_page(page)
+        self._right.set_current_page(page)
 
-    def _on_annotation_added(self, page_num: int) -> None:
-        self._thumbs.refresh_page(page_num)
-        self.setWindowTitle(f"PDFreader — {self._doc.path.name} *" if self._doc.path else "PDFreader *")
+        lib_doc = self._library.active()
+        if lib_doc:
+            lib_doc.update_progress(page)
+            self._update_status(lib_doc.progress, self._viewer.current_zoom())
+            self._left.load_bookmarks(lib_doc.bookmarks, page)
 
-    def _update_status(self, page_num: int) -> None:
-        total = self._doc.page_count
-        zoom = int(self._viewer.current_zoom() * 100)
-        self._lbl_page.setText(f"Seite {page_num + 1} / {total}   |   {zoom}%")
-        self._zoom_label.setText(f"{zoom}%")
-        if self._doc.path:
-            self._lbl_file.setText(self._doc.path.name)
-            self.setWindowTitle(f"PDFreader — {self._doc.path.name}")
+    def _on_zoom_changed(self, zoom: float) -> None:
+        self._toolbar.set_zoom(zoom)
+        lib_doc = self._library.active()
+        progress = lib_doc.progress if lib_doc else 0.0
+        self._update_status(progress, zoom)
 
-    # ------------------------------------------------------------------
-    # Window close
-    # ------------------------------------------------------------------
+    def _on_pdf_annotation_added(self, page_num: int) -> None:
+        self.setWindowTitle(
+            f"Verdant Reader  —  {self._doc.path.name} *" if self._doc.path
+            else "Verdant Reader *"
+        )
+
+    def _update_status(self, progress: float, zoom: float) -> None:
+        self._status.set_progress(progress, zoom)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Misc
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _position_minimap(self) -> None:
+        if not self._minimap.isVisible():
+            return
+        vw = self._viewer
+        mm = self._minimap
+        mm.adjustSize()
+        x = vw.width() - mm.width() - 20
+        y = vw.height() - mm.height() - 20
+        mm.move(vw.mapTo(vw.parent(), vw.rect().topLeft()) + __import__("PyQt6.QtCore", fromlist=["QPoint"]).QPoint(x, y))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self._position_minimap)
+
+    def _set_doc_actions_enabled(self, on: bool) -> None:
+        for act in (self._act_save, self._act_save_as, self._act_export, self._act_close):
+            act.setEnabled(on)
+
+    def _confirm_discard(self) -> bool:
+        return QMessageBox.question(
+            self, "Aenderungen verwerfen?",
+            "Es gibt ungespeicherte Aenderungen. Trotzdem fortfahren?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
 
     def closeEvent(self, event) -> None:
         if self._doc.modified:
             reply = QMessageBox.question(
-                self, "Ungespeicherte Änderungen",
-                "Es gibt ungespeicherte Änderungen. Vor dem Beenden speichern?",
+                self, "Ungespeicherte Aenderungen",
+                "Vor dem Beenden speichern?",
                 QMessageBox.StandardButton.Save |
                 QMessageBox.StandardButton.Discard |
                 QMessageBox.StandardButton.Cancel,
             )
             if reply == QMessageBox.StandardButton.Save:
-                self.save_file()
+                self._save_file()
                 event.accept()
             elif reply == QMessageBox.StandardButton.Discard:
                 event.accept()
             else:
                 event.ignore()
-        else:
-            event.accept()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _set_actions_enabled(self, enabled: bool) -> None:
-        for act in (self._act_save, self._act_save_as, self._act_export,
-                    self._act_zoom_in, self._act_zoom_out, self._act_zoom_reset,
-                    self._act_goto, self._act_search,
-                    self._act_tool_select, self._act_tool_highlight,
-                    self._act_tool_text, self._act_tool_note):
-            act.setEnabled(enabled)
-        self._btn_save.setEnabled(enabled)
-        for btn in self._tool_buttons.values():
-            btn.setEnabled(enabled)
-        self._color_combo.setEnabled(enabled)
-
-    def _confirm_discard(self) -> bool:
-        reply = QMessageBox.question(
-            self, "Änderungen verwerfen?",
-            "Es gibt ungespeicherte Änderungen. Trotzdem fortfahren?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        return reply == QMessageBox.StandardButton.Yes

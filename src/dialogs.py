@@ -21,28 +21,26 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-_DIALOG_STYLE = """
-QDialog {
-    background: #2b2b2b;
-    color: #dddddd;
-}
-QLabel { color: #cccccc; }
-QPlainTextEdit, QLineEdit, QSpinBox, QComboBox {
-    background: #3c3f41;
-    color: #dddddd;
-    border: 1px solid #555555;
-    border-radius: 4px;
-    padding: 4px;
-}
-QPushButton {
-    background: #4b6eaf;
-    color: white;
-    border: none;
-    border-radius: 4px;
-    padding: 6px 14px;
-}
-QPushButton:hover { background: #5c82cc; }
-QPushButton[text="Abbrechen"] { background: #555555; }
+from .theme import ACCENT, ACCENT2, BG, BORDER, MUTED, SURFACE, SURFACE2, SURFACE3, TEXT
+
+_DIALOG_STYLE = f"""
+QDialog      {{ background: {SURFACE}; color: {TEXT}; }}
+QLabel       {{ color: {TEXT}; background: transparent; }}
+QPlainTextEdit, QLineEdit, QSpinBox, QComboBox {{
+    background: {SURFACE2}; color: {TEXT};
+    border: 1px solid {BORDER}; border-radius: 6px; padding: 5px 8px;
+}}
+QPlainTextEdit:focus, QLineEdit:focus, QSpinBox:focus {{ border-color: {ACCENT}; }}
+QComboBox QAbstractItemView {{ background: {SURFACE2}; color: {TEXT};
+    selection-background-color: {ACCENT}; border: 1px solid {BORDER}; }}
+QPushButton {{
+    background: {ACCENT}; color: {BG}; border: none;
+    border-radius: 6px; padding: 7px 16px; font-weight: 600;
+}}
+QPushButton:hover {{ background: {ACCENT2}; }}
+QPushButton[flat="true"] {{
+    background: {SURFACE3}; color: {TEXT};
+}}
 """
 
 
